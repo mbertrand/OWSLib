@@ -85,6 +85,7 @@ Also, the directory tests/ contains several examples of well-formed "Execute" re
 """
 
 from __future__ import (absolute_import, division, print_function)
+import json
 
 from owslib.etree import etree
 from owslib.ows import DEFAULT_OWS_NAMESPACE, ServiceIdentification, ServiceProvider, OperationsMetadata
@@ -109,10 +110,13 @@ OGC_NAMESPACE = n.get_namespace("ogc")
 GML_NAMESPACE = n.get_namespace("gml")
 DRAW_NAMESPACE = n.get_namespace("draw")
 
-GML_SCHEMA_LOCATION = "http://schemas.opengis.net/gml/3.1.1/base/feature.xsd"
+GML_SCHEMA_LOCATION = "http://schemas.opengis.net/gml/{version}/base/feature.xsd"
 DRAW_SCHEMA_LOCATION = 'http://cida.usgs.gov/climate/derivative/xsd/draw.xsd'
-WPS_DEFAULT_SCHEMA_LOCATION = 'http://schemas.opengis.net/wps/1.0.0/wpsExecute_request.xsd'
+WFS_SCHEMA_LOCATION = 'http://www.opengis.net/wfs/{version}/WFS.xsd'
+WPS_DEFAULT_SCHEMA_LOCATION = 'http://schemas.opengis.net/wps/{version}/wpsExecute_request.xsd'
+
 WPS_DEFAULT_VERSION = '1.0.0'
+GML_DEFAULT_VERSION = '3.1.1'
 
 def get_namespaces():
     ns = n.get_namespaces(["ogc","wfs","wps","gml","xsi","xlink"])
@@ -238,7 +242,7 @@ class WebProcessingService(object):
         # build metadata objects
         return self._parseProcessMetadata(rootElement)
         
-    def execute(self, identifier, inputs, output=None, request=None, response=None):
+    def execute(self, identifier, inputs, output=None, request=None, response=None, output_raw=False, output_format=None):
         """
         Submits a WPS process execution request. 
         Returns a WPSExecution object, which can be used to monitor the status of the job, and ultimately retrieve the result.
@@ -256,7 +260,7 @@ class WebProcessingService(object):
 
         # build XML request from parameters 
         if request is None:
-           requestElement = execution.buildRequest(identifier, inputs, output)
+           requestElement = execution.buildRequest(identifier, inputs, output, output_raw, output_format)
            request = etree.tostring( requestElement )
            execution.request = request   
         log.debug(request)
@@ -266,12 +270,12 @@ class WebProcessingService(object):
             response = execution.submitRequest(request)
         else:
             response = etree.fromstring(response)
-            
-        log.debug(etree.tostring(response))
-            
-        # parse response
-        execution.parseResponse(response)
-                        
+        if not output_format:
+            log.debug(etree.tostring(response))
+            # parse response
+            execution.parseResponse(response)
+        else:
+            log.debug(response)
         return execution
     
         
@@ -349,8 +353,6 @@ class WebProcessingService(object):
                     self.processes.append(p)
                     if self.verbose==True:
                         dump(self.processes[-1])
-
-                   
         
 class WPSReader(object):
     """
@@ -377,14 +379,17 @@ class WPSReader(object):
             # split URL into base url and query string to use utility function
             spliturl=request_url.split('?')
             u = openURL(spliturl[0], spliturl[1], method='Get', username=username, password=password)
-            return etree.fromstring(u.read())
+            return self.parseResponse(u)
         
         elif method == 'Post':
             u = openURL(url, data, method='Post', username = username, password = password)
-            return etree.fromstring(u.read())
+            return self.parseResponse(u)
             
         else:
             raise Exception("Unrecognized HTTP method: %s" % method)
+
+    def parseResponse(self, wps_response):
+        return etree.fromstring(wps_response.read())
                 
         
     def readFromString(self, string):
@@ -394,7 +399,7 @@ class WPSReader(object):
         
         if not isinstance(string, str) and not isinstance(string, bytes):
             raise ValueError("Input must be of type string, not %s" % type(string))
-        return etree.fromstring(string)    
+        return etree.fromstring(string)
 
 class WPSCapabilitiesReader(WPSReader):
     """
@@ -439,8 +444,9 @@ class WPSExecuteReader(WPSReader):
     """
     Class that reads and parses a WPS Execute response document into a etree infoset
     """
-    def __init__(self, verbose=False):
+    def __init__(self, verbose=False, mime_type=None):
         # superclass initializer
+        self.mimeType = mime_type
         super(WPSExecuteReader,self).__init__(verbose=verbose)
         
     def readFromUrl(self, url, data={}, method='Get', username=None, password=None):
@@ -451,7 +457,11 @@ class WPSExecuteReader(WPSReader):
          
          return self._readFromUrl(url, data, method, username=username, password=password)
 
-    
+    def parseResponse(self, wps_response):
+        if not self.mimeType:
+            return etree.fromstring(wps_response.read())
+        return wps_response.read()
+
 class WPSExecution():
     """
     Class that represents a single WPS process executed on a remote WPS service.
@@ -484,7 +494,7 @@ class WPSExecution():
         self.processOutputs=[]
         
         
-    def buildRequest(self, identifier, inputs=[], output=None):
+    def buildRequest(self, identifier, inputs=[], output=None, output_raw=False, output_format=None):
         """
         Method to build a WPS process request.
         identifier: the requested process identifier
@@ -494,7 +504,11 @@ class WPSExecution():
               and the object must contain a 'getXml()' method that returns an XML infoset to be included in the WPS request
         output: optional identifier if process output is to be returned as a hyperlink reference
         """
-        
+
+        self.output = output
+        self.output_raw = output_raw
+        self.output_format = output_format
+
         #<wps:Execute xmlns:wps="http://www.opengis.net/wps/1.0.0" 
         #             xmlns:ows="http://www.opengis.net/ows/1.1" 
         #             xmlns:xlink="http://www.w3.org/1999/xlink" 
@@ -505,7 +519,7 @@ class WPSExecution():
         root = etree.Element(nspath_eval('wps:Execute', namespaces))
         root.set('service', 'WPS')
         root.set('version', WPS_DEFAULT_VERSION)
-        root.set(nspath_eval('xsi:schemaLocation', namespaces), '%s %s' % (namespaces['wps'], WPS_DEFAULT_SCHEMA_LOCATION) )
+        root.set(nspath_eval('xsi:schemaLocation', namespaces), '%s %s' % (namespaces['wps'], WPS_DEFAULT_SCHEMA_LOCATION.format(version=self.version)))
         
         # <ows:Identifier>gov.usgs.cida.gdp.wps.algorithm.FeatureWeightedGridStatisticsAlgorithm</ows:Identifier>
         identifierElement = etree.SubElement(root, nspath_eval('ows:Identifier', namespaces))
@@ -538,7 +552,7 @@ class WPSExecution():
             #   <ows:Identifier>FEATURE_COLLECTION</ows:Identifier>
             #   <wps:Reference xlink:href="http://igsarm-cida-gdp2.er.usgs.gov:8082/geoserver/wfs">
             #      <wps:Body>
-            #        <wfs:GetFeature xmlns:wfs="http://www.opengis.net/wfs" xmlns:ogc="http://www.opengis.net/ogc" xmlns:gml="http://www.opengis.net/gml" service="WFS" version="1.1.0" outputFormat="text/xml; subtype=gml/3.1.1" xsi:schemaLocation="http://www.opengis.net/wfs ../wfs/1.1.0/WFS.xsd">
+            #        <wfs:GetFeature xmlns:wfs="http://www.opengis.net/wfs" xmlns:ogc="http://www.opengis.net/ogc" xmlns:gml="http://www.opengis.net/gml" service="WFS" version="1.1.0" outputFormat="text/xml; subtype=gml/3.1.1" xsi:schemaLocation="http://www.opengis.net/wfs/1.1.0/WFS.xsd">
             #            <wfs:Query typeName="sample:CONUS_States">
             #                <wfs:PropertyName>the_geom</wfs:PropertyName>
             #                <wfs:PropertyName>STATE</wfs:PropertyName>
@@ -565,16 +579,30 @@ class WPSExecution():
         # </wps:ResponseForm>
         if output is not None:
             responseFormElement = etree.SubElement(root, nspath_eval('wps:ResponseForm', namespaces))
-            responseDocumentElement = etree.SubElement(responseFormElement, nspath_eval('wps:ResponseDocument', namespaces), 
-                                                       attrib={'storeExecuteResponse':'true', 'status':'true'} )
-            if isinstance(output, str):
-                self._add_output(responseDocumentElement, output, asReference=True)
-            elif isinstance(output, list):
-                for (identifier,as_reference) in output:
-                    self._add_output(responseDocumentElement, identifier, asReference=as_reference)
+            if output_raw:
+                self._addresponseRawDataOutput(responseFormElement)
             else:
-                raise Exception('output parameter is neither string nor list. output=%s' % output)
+                self._addResponseDocumentElement(responseFormElement)
         return root
+
+    def _addresponseRawDataOutput(self, responseFormElement):
+        responseRawDataOutput = etree.SubElement(
+            responseFormElement, nspath_eval('wps:RawDataOutput', namespaces))
+        if self.output_format:
+            responseRawDataOutput.attrib['mimeType'] = self.output_format
+        self._add_output(responseRawDataOutput, self.output)
+
+    def _addResponseDocumentElement(self, responseFormElement):
+        responseDocumentElement = etree.SubElement(responseFormElement, nspath_eval('wps:ResponseDocument', namespaces),
+                                                   attrib={'storeExecuteResponse':'true', 'status':'true'} )
+        if isinstance(self.output, str):
+            self._add_output(responseDocumentElement, self.output, asReference=True)
+        elif isinstance(self.output, list):
+            for (identifier,as_reference) in self.output:
+                self._add_output(responseDocumentElement, identifier, asReference=as_reference)
+        else:
+            raise Exception('output parameter is neither string nor list. output=%s' % self.output)
+
 
     def _add_output(self, element, identifier, asReference=False):
         outputElement = etree.SubElement(element, nspath_eval('wps:Output', namespaces), 
@@ -604,11 +632,18 @@ class WPSExecution():
             response = reader.readFromString(response)
                 
         # store latest response
-        self.response = etree.tostring(response)
-        log.debug(self.response)
+        if self.output_format:
+            self.response = response
+            try:
+                #If an error occurred, an XML response will be returned
+                self.parseResponse(response)
+            except Exception as e:
+                self.status=='ProcessSucceeded'
+        else:
+            self.response = etree.tostring(response)
+            log.debug(self.response)
+            self.parseResponse(response)
 
-        self.parseResponse(response)
-                    
         # sleep given number of seconds
         if self.isComplete()==False:
             log.info('Sleeping %d seconds...' % sleepSecs)
@@ -684,11 +719,12 @@ class WPSExecution():
         """ 
         
         self.request = request
-        reader = WPSExecuteReader(verbose=self.verbose)
+        reader = WPSExecuteReader(verbose=self.verbose, mime_type=self.output_format)
         response = reader.readFromUrl(self.url, request, method='Post', username=self.username, password=self.password)
-        self.response = response
+        if self.output_raw:
+            self.response = response
         return response
- 
+
         '''       
         if response is None:
             # override status location
@@ -1240,14 +1276,40 @@ class FeatureCollection(IComplexDataInput):
     
     def getXml(self):
         raise NotImplementedError
-    
+
+class ExecutionInput(IComplexDataInput):
+
+    def __init__(self, wfsUrl, wfsQuery, wfsVersion="1.1.0", wfsMethod="POST"):
+        self.url = wfsUrl
+        self.subprocess = wfsQuery
+        self.method = wfsMethod
+        self.version = wfsVersion
+
+    def getXml(self):
+        root = etree.Element(
+            nspath_eval('wps:Reference', namespaces),
+            attrib={
+                nspath_eval("xlink:href",namespaces): self.url,
+                'method': self.method
+            }
+        )
+        bodyElement = etree.SubElement(root, nspath_eval('wps:Body', namespaces))
+        # executeElement = etree.SubElement(bodyElement,
+        #                                   nspath_eval('wps:Execute', namespaces),
+        #                                               attrib={
+        #         "version": self.version,
+        #         'service': "WPS"
+        #     })
+        bodyElement.append(self.subprocess)
+        return root
+
 class WFSFeatureCollection(FeatureCollection):
     '''
     FeatureCollection specified by a WFS query.
     All subclasses must implement the getQuery() method to provide the specific query portion of the XML.
     '''
     
-    def __init__(self, wfsUrl, wfsQuery):
+    def __init__(self, wfsUrl, wfsQuery, wfsVersion="1.1.0", wfsMethod="POST"):
         '''
         wfsUrl: the WFS service URL
                 example: wfsUrl = "http://igsarm-cida-gdp2.er.usgs.gov:8082/geoserver/wfs"
@@ -1255,23 +1317,31 @@ class WFSFeatureCollection(FeatureCollection):
         '''
         self.url = wfsUrl
         self.query = wfsQuery
-    
+        self.method = wfsMethod
+        self.version = wfsVersion
+
     #    <wps:Reference xlink:href="http://igsarm-cida-gdp2.er.usgs.gov:8082/geoserver/wfs">
     #      <wps:Body>
-    #        <wfs:GetFeature xmlns:wfs="http://www.opengis.net/wfs" xmlns:ogc="http://www.opengis.net/ogc" xmlns:gml="http://www.opengis.net/gml" service="WFS" version="1.1.0" outputFormat="text/xml; subtype=gml/3.1.1" xsi:schemaLocation="http://www.opengis.net/wfs ../wfs/1.1.0/WFS.xsd">
+    #        <wfs:GetFeature xmlns:wfs="http://www.opengis.net/wfs" xmlns:ogc="http://www.opengis.net/ogc" xmlns:gml="http://www.opengis.net/gml" service="WFS" version="1.1.0" outputFormat="text/xml; subtype=gml/3.1.1" xsi:schemaLocation="http://www.opengis.net/wfs/1.1.0/WFS.xsd">
     #            .......
     #        </wfs:GetFeature>
     #      </wps:Body>
     #   </wps:Reference>
     def getXml(self):
         
-        root = etree.Element(nspath_eval('wps:Reference', namespaces), attrib = { nspath_eval("xlink:href",namespaces) : self.url} )
+        root = etree.Element(
+            nspath_eval('wps:Reference', namespaces),
+            attrib={
+                nspath_eval("xlink:href",namespaces): self.url,
+                'method': self.method
+            }
+        )
         bodyElement = etree.SubElement(root, nspath_eval('wps:Body', namespaces))
         getFeatureElement = etree.SubElement(bodyElement, nspath_eval('wfs:GetFeature', namespaces),
                                              attrib = { "service":"WFS",
-                                                        "version":"1.1.0",
+                                                        "version":self.version,
                                                         "outputFormat":"text/xml; subtype=gml/3.1.1",
-                                                        nspath_eval("xsi:schemaLocation",namespaces):"%s %s" % (namespaces['wfs'], '../wfs/1.1.0/WFS.xsd')})
+                                                        nspath_eval("xsi:schemaLocation",namespaces): WFS_SCHEMA_LOCATION.format(version=self.version)})
         
         #            <wfs:Query typeName="sample:CONUS_States">
         #                <wfs:PropertyName>the_geom</wfs:PropertyName>
@@ -1322,14 +1392,15 @@ class GMLMultiPolygonFeatureCollection(FeatureCollection):
     Class that represents a FeatureCollection defined as a GML multi-polygon.
     '''
     
-    def __init__(self, polygons):
+    def __init__(self, polygons, version=None):
         '''
         Initializer accepts an array of polygons, where each polygon is an array of (lat,lon) tuples.
         Example: polygons = [ [(-102.8184, 39.5273), (-102.8184, 37.418), (-101.2363, 37.418), (-101.2363, 39.5273), (-102.8184, 39.5273)],
                               [(-92.8184, 39.5273), (-92.8184, 37.418), (-91.2363, 37.418), (-91.2363, 39.5273), (-92.8184, 39.5273)] ]
         '''
         self.polygons = polygons
-    
+        self.version = version or GML_DEFAULT_VERSION
+
     def getXml(self):
         '''
             <wps:Data>
@@ -1363,7 +1434,7 @@ class GMLMultiPolygonFeatureCollection(FeatureCollection):
         '''
         dataElement = etree.Element(nspath_eval('wps:Data', namespaces))
         complexDataElement = etree.SubElement(dataElement, nspath_eval('wps:ComplexData', namespaces),
-                                              attrib={"mimeType":"text/xml", "encoding":"UTF-8", "schema":GML_SCHEMA_LOCATION} )
+                                              attrib={"mimeType":"text/xml", "encoding":"UTF-8", "schema":GML_SCHEMA_LOCATION.format(version=self.version)})
         featureMembersElement = etree.SubElement(complexDataElement, nspath_eval('gml:featureMembers', namespaces),
                                                  attrib={ nspath_eval("xsi:schemaLocation",namespaces):"%s %s" % (DRAW_NAMESPACE, DRAW_SCHEMA_LOCATION)})
         boxElement = etree.SubElement(featureMembersElement, nspath_eval('gml:box', namespaces), attrib={ nspath_eval("gml:id",namespaces):"box.1" })
