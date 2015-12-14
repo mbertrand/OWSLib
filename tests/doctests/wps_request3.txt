@@ -38,6 +38,9 @@ Supply process input arguments
     >>> execution = WPSExecution()
     >>> requestElement = execution.buildRequest(processid, inputs, output=output)
     >>> request = etree.tostring( requestElement )
+    >>> outfile = open('/tmp/wps3.txt', 'w')
+    >>> outfile.write(request)
+    >>> outfile.close()
 
 Compare to cached XML request
 
